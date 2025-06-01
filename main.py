@@ -20,6 +20,8 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+PORT = int(os.environ.get("PORT", 8000))
+
 class GradCAM:
     """GradCAM implementation for visualizing model attention"""
     
@@ -304,15 +306,15 @@ app = FastAPI(title="Breast Cancer Classification API", version="1.0.0")
 # Global predictor instance
 predictor = None
 
+# Update your startup event
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the model on startup"""
     global predictor
     try:
-        model_path = "deployment_model/breast_cancer_model.pth"
-        config_path = "deployment_model/model_config.json"
+        # Use environment variables for paths
+        model_path = os.environ.get("MODEL_PATH", "deployment_model/breast_cancer_model.pth")
+        config_path = os.environ.get("CONFIG_PATH", "deployment_model/model_config.json")
         
-        # Check if model files exist
         if not os.path.exists(model_path):
             logger.error(f"Model file not found: {model_path}")
             return
@@ -709,4 +711,4 @@ async def debug_gradcam(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
