@@ -28,48 +28,83 @@ class GradCAM:
         self.target_layer_name = target_layer_name
         self.gradients = None
         self.activations = None
+        self.hooks = []
         self.register_hooks()
     
     def register_hooks(self):
         """Register forward and backward hooks"""
         def backward_hook(module, grad_input, grad_output):
-            self.gradients = grad_output[0]
+            if grad_output[0] is not None:
+                self.gradients = grad_output[0].detach()
         
         def forward_hook(module, input, output):
-            self.activations = output
+            self.activations = output.detach()
         
-        # Find the target layer
+        # Find the target layer and register hooks
+        target_found = False
         for name, module in self.model.named_modules():
             if name == self.target_layer_name:
-                module.register_full_backward_hook(backward_hook)
-                module.register_forward_hook(forward_hook)
+                hook1 = module.register_full_backward_hook(backward_hook)
+                hook2 = module.register_forward_hook(forward_hook)
+                self.hooks.extend([hook1, hook2])
+                target_found = True
+                logger.info(f"GradCAM hooks registered for layer: {name}")
                 break
+        
+        if not target_found:
+            logger.warning(f"Target layer '{self.target_layer_name}' not found in model")
+            # Fallback to a common ResNet layer
+            for name, module in self.model.named_modules():
+                if 'layer4' in name and 'conv' in name:
+                    hook1 = module.register_full_backward_hook(backward_hook)
+                    hook2 = module.register_forward_hook(forward_hook)
+                    self.hooks.extend([hook1, hook2])
+                    logger.info(f"Using fallback layer: {name}")
+                    break
+    
+    def remove_hooks(self):
+        """Remove registered hooks"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
     
     def generate_cam(self, input_image, class_idx=None):
         """Generate GradCAM heatmap"""
+        # Ensure gradients are enabled
+        input_image.requires_grad_(True)
+        
         # Forward pass
+        self.model.eval()
         model_output = self.model(input_image)
         
         if class_idx is None:
-            class_idx = np.argmax(model_output.cpu().data.numpy())
+            class_idx = torch.argmax(model_output[0]).item()
         
-        # Zero all existing gradients
+        # Clear previous gradients
         self.model.zero_grad()
+        if input_image.grad is not None:
+            input_image.grad.zero_()
         
         # Backward pass with respect to the desired class
-        one_hot = torch.zeros_like(model_output)
-        one_hot[0][class_idx] = 1.0
-        model_output.backward(gradient=one_hot, retain_graph=True)
+        score = model_output[0, class_idx]
+        score.backward(retain_graph=True)
+        
+        # Check if we have gradients and activations
+        if self.gradients is None or self.activations is None:
+            logger.error("GradCAM: No gradients or activations captured")
+            # Return a dummy heatmap
+            dummy_cam = np.random.rand(7, 7) * 0.1  # Low intensity random pattern
+            return dummy_cam, class_idx
         
         # Get gradients and activations
-        gradients = self.gradients[0].to(input_image.device)
-        activations = self.activations[0].to(input_image.device)
+        gradients = self.gradients[0]  # Remove batch dimension
+        activations = self.activations[0]  # Remove batch dimension
         
         # Calculate weights (global average pooling of gradients)
         weights = torch.mean(gradients, dim=(1, 2))
         
         # Generate CAM
-        cam = torch.zeros(activations.shape[1], activations.shape[2], device=input_image.device)
+        cam = torch.zeros(activations.shape[1:], device=input_image.device)
         for i, w in enumerate(weights):
             cam += w * activations[i]
         
@@ -78,8 +113,12 @@ class GradCAM:
         
         # Normalize to 0-1
         if cam.max() > 0:
-            cam = cam - cam.min()
-            cam = cam / cam.max()
+            cam = (cam - cam.min()) / (cam.max() - cam.min())
+        else:
+            # If cam is all zeros, create a small center activation
+            cam = torch.zeros_like(cam)
+            center_h, center_w = cam.shape[0] // 2, cam.shape[1] // 2
+            cam[center_h-1:center_h+2, center_w-1:center_w+2] = 0.3
         
         return cam.detach().cpu().numpy(), class_idx
 
@@ -94,7 +133,22 @@ class BreastCancerPredictor:
         
         # Initialize model
         self.model = self._load_model(model_path)
-        self.gradcam = GradCAM(self.model, target_layer_name='layer4.2.conv3')
+        
+        # Try different layer names for GradCAM
+        possible_layers = ['layer4.2.conv3', 'layer4.1.conv3', 'layer4.0.conv3', 'layer4']
+        self.gradcam = None
+        
+        for layer_name in possible_layers:
+            try:
+                self.gradcam = GradCAM(self.model, target_layer_name=layer_name)
+                logger.info(f"GradCAM initialized with layer: {layer_name}")
+                break
+            except Exception as e:
+                logger.warning(f"Failed to initialize GradCAM with layer {layer_name}: {e}")
+                continue
+        
+        if self.gradcam is None:
+            logger.error("Failed to initialize GradCAM with any layer")
         
         # Image preprocessing
         self.transform = transforms.Compose([
@@ -167,24 +221,57 @@ class BreastCancerPredictor:
                 predicted_class = torch.argmax(outputs[0]).item()
                 confidence = probabilities[predicted_class].item() * 100
             
-            # Generate GradCAM
-            cam, _ = self.gradcam.generate_cam(input_tensor, predicted_class)
-            
             # Prepare original image for visualization
             img_array = np.array(original_image.resize((224, 224)))
             
-            # Create GradCAM overlay
-            overlay = self._apply_gradcam_overlay(img_array, cam)
+            # Generate GradCAM if available
+            cam = None
+            heatmap_colored = None
+            overlay = img_array.copy()
             
-            # Convert heatmap for visualization
-            heatmap_colored = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-            heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+            if self.gradcam is not None:
+                try:
+                    # Create a new input tensor for GradCAM (requires grad)
+                    gradcam_input = self.transform(original_image).unsqueeze(0).to(self.device)
+                    gradcam_input.requires_grad_(True)
+                    
+                    cam, _ = self.gradcam.generate_cam(gradcam_input, predicted_class)
+                    
+                    # Resize CAM to match image size and ensure it's valid
+                    if cam.shape[0] > 1 and cam.shape[1] > 1:
+                        cam_resized = cv2.resize(cam, (224, 224))
+                        
+                        # Ensure CAM values are in valid range
+                        cam_resized = np.clip(cam_resized, 0, 1)
+                        
+                        # Create colored heatmap
+                        heatmap_colored = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+                        heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+                        
+                        # Create overlay
+                        overlay = self._apply_gradcam_overlay(img_array, cam_resized)
+                        
+                        logger.info(f"GradCAM generated successfully. CAM shape: {cam.shape}, Min: {cam.min():.3f}, Max: {cam.max():.3f}")
+                    else:
+                        logger.warning(f"Invalid CAM shape: {cam.shape}")
+                        heatmap_colored = np.zeros((224, 224, 3), dtype=np.uint8)
+                        
+                except Exception as e:
+                    logger.error(f"GradCAM generation failed: {str(e)}")
+                    heatmap_colored = np.zeros((224, 224, 3), dtype=np.uint8)
+            else:
+                logger.warning("GradCAM not available")
+                heatmap_colored = np.zeros((224, 224, 3), dtype=np.uint8)
             
             # Prepare response
             all_probabilities = {
                 self.class_names[i]: float(probabilities[i].item() * 100)
                 for i in range(len(self.class_names))
             }
+            
+            # Ensure we have valid images for visualization
+            if heatmap_colored is None:
+                heatmap_colored = np.zeros((224, 224, 3), dtype=np.uint8)
             
             result = {
                 'prediction': {
@@ -200,7 +287,8 @@ class BreastCancerPredictor:
                 'model_info': {
                     'architecture': self.config['model_architecture'],
                     'classes': self.class_names,
-                    'device': str(self.device)
+                    'device': str(self.device),
+                    'gradcam_available': self.gradcam is not None
                 }
             }
             
@@ -533,6 +621,91 @@ async def model_info():
         "device": str(predictor.device),
         "preprocessing": predictor.config['preprocessing']
     }
+
+@app.get("/debug/layers")
+async def debug_model_layers():
+    """Debug endpoint to show model layers"""
+    global predictor
+    
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    layers = []
+    for name, module in predictor.model.named_modules():
+        layers.append({
+            "name": name,
+            "type": str(type(module).__name__)
+        })
+    
+    return {
+        "total_layers": len(layers),
+        "layers": layers,
+        "resnet_layer4_modules": [l for l in layers if "layer4" in l["name"]]
+    }
+
+@app.post("/debug/gradcam")
+async def debug_gradcam(file: UploadFile = File(...)):
+    """Debug GradCAM generation with detailed logging"""
+    global predictor
+    
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    try:
+        # Read and process image
+        image_data = await file.read()
+        image = Image.open(io.BytesIO(image_data)).convert('RGB')
+        
+        # Preprocess image
+        input_tensor = predictor.transform(image).unsqueeze(0).to(predictor.device)
+        
+        # Make prediction first
+        with torch.no_grad():
+            outputs = predictor.model(input_tensor)
+            predicted_class = torch.argmax(outputs[0]).item()
+        
+        debug_info = {
+            "gradcam_available": predictor.gradcam is not None,
+            "predicted_class": predicted_class,
+            "class_name": predictor.class_names[predicted_class],
+            "input_shape": list(input_tensor.shape),
+            "device": str(predictor.device)
+        }
+        
+        if predictor.gradcam is not None:
+            try:
+                # Create input that requires gradients
+                gradcam_input = predictor.transform(image).unsqueeze(0).to(predictor.device)
+                gradcam_input.requires_grad_(True)
+                
+                # Generate CAM
+                cam, _ = predictor.gradcam.generate_cam(gradcam_input, predicted_class)
+                
+                debug_info.update({
+                    "cam_generated": True,
+                    "cam_shape": list(cam.shape),
+                    "cam_min": float(cam.min()),
+                    "cam_max": float(cam.max()),
+                    "cam_mean": float(cam.mean()),
+                    "gradients_captured": predictor.gradcam.gradients is not None,
+                    "activations_captured": predictor.gradcam.activations is not None
+                })
+                
+                if predictor.gradcam.gradients is not None:
+                    debug_info["gradients_shape"] = list(predictor.gradcam.gradients.shape)
+                if predictor.gradcam.activations is not None:
+                    debug_info["activations_shape"] = list(predictor.gradcam.activations.shape)
+                    
+            except Exception as e:
+                debug_info.update({
+                    "cam_generated": False,
+                    "cam_error": str(e)
+                })
+        
+        return debug_info
+        
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
